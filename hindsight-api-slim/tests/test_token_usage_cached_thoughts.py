@@ -22,12 +22,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from pydantic import BaseModel
 
+from hindsight_api.engine.memory_engine import MemoryEngine
 from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
 from hindsight_api.engine.reflect.agent import _generate_structured_output
-from hindsight_api.engine.reflect.models import StructuredOutputResult, TokenUsageSummary
+from hindsight_api.engine.reflect.models import ReflectAgentResult, StructuredOutputResult, TokenUsageSummary
 from hindsight_api.engine.response_models import LLMToolCallResult, TokenUsage
 from hindsight_api.extensions.operation_validator import RetainResult
 from hindsight_api.metrics import MetricsCollector
+from hindsight_api.models import RequestContext
 
 
 class _OkModel(BaseModel):
@@ -549,3 +551,91 @@ async def test_openai_compatible_call_without_reasoning_reports_completion_verba
     assert token_usage.output_tokens == 45
     assert token_usage.thoughts_tokens == 0
     assert token_usage.total_tokens == 165
+
+
+# --- #5487: reflect_async must carry the agent's cached/thoughts into ReflectResult ---
+#
+# The reflect agent sums per-call cached/thoughts tokens into TokenUsageSummary and
+# returns it on ReflectAgentResult.usage — every earlier section here pins a link of
+# that chain. The last link, reflect_async's conversion of agent usage into the
+# response TokenUsage, constructed only input/output/total and let both new fields
+# fall back to their 0 defaults, so the REST/MCP reflect response always reported
+# cached_tokens=0 / thoughts_tokens=0 no matter what the provider reported.
+
+
+def _reflect_engine_with_agent(monkeypatch, agent_result) -> MemoryEngine:
+    """A shell MemoryEngine whose I/O collaborators are stubbed and whose reflect
+    agent is replaced by one returning ``agent_result`` — light enough to drive
+    reflect_async all the way to its response assembly without a database."""
+    engine = object.__new__(MemoryEngine)
+    engine._reflect_llm_config = SimpleNamespace(provider="openai")
+    engine._operation_validator = None
+    engine._config_resolver = SimpleNamespace(
+        resolve_full_config=AsyncMock(return_value=SimpleNamespace(llm_output_language=None)),
+        get_bank_config=AsyncMock(return_value={}),
+    )
+    engine._authenticate_tenant = AsyncMock()
+    engine._tag_scope = AsyncMock(return_value=None)
+    engine.ensure_bank_profile = AsyncMock(return_value={"name": "Test", "mission": ""})
+    engine._bank_freshness = AsyncMock(return_value={})
+    engine._evidence_as_stored = AsyncMock(return_value=[])
+    engine.list_directives = AsyncMock(return_value=SimpleNamespace(items=[]))
+    engine._llm_for_reflect_operation = lambda _op: SimpleNamespace(with_config=lambda *_a, **_k: SimpleNamespace())
+
+    class _Conn:
+        async def fetchval(self, *_a, **_k):
+            return 0
+
+        async def fetch(self, *_a, **_k):
+            return []
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_a):
+            return False
+
+    backend = MagicMock()
+    backend.acquire.return_value = _Acquire()
+    engine._get_backend = AsyncMock(return_value=backend)
+
+    monkeypatch.setattr(
+        "hindsight_api.engine.memory_engine.run_reflect_agent",
+        AsyncMock(return_value=agent_result),
+    )
+    monkeypatch.setattr(
+        "hindsight_api.engine.memory_engine.get_config",
+        lambda: SimpleNamespace(
+            reflect_max_iterations=2,
+            reflect_max_context_tokens=4096,
+            reflect_wall_timeout=5,
+            database_schema="public",
+        ),
+    )
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_reflect_async_propagates_agent_cached_and_thoughts_tokens(monkeypatch):
+    """reflect_async converts ReflectAgentResult.usage into the response's TokenUsage —
+    cached_tokens and thoughts_tokens must survive that conversion, not reset to 0."""
+    agent_result = ReflectAgentResult(
+        text="answer",
+        usage=TokenUsageSummary(
+            input_tokens=100,
+            output_tokens=50,
+            total_tokens=150,
+            cached_tokens=123,
+            thoughts_tokens=45,
+        ),
+    )
+    engine = _reflect_engine_with_agent(monkeypatch, agent_result)
+
+    result = await engine.reflect_async("bank-1", "question", request_context=RequestContext())
+
+    assert result.usage.input_tokens == 100
+    assert result.usage.output_tokens == 50
+    assert result.usage.total_tokens == 150
+    assert result.usage.cached_tokens == 123  # was 0: dropped by the TokenUsage conversion (#5487)
+    assert result.usage.thoughts_tokens == 45  # was 0: dropped by the TokenUsage conversion (#5487)
